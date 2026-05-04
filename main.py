@@ -1,23 +1,46 @@
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from argon2 import PasswordHasher
 from urllib.parse import urlparse, parse_qs
 import base64
 import json
 import jwt
+import os
 import sqlite3
 import datetime
+import uuid
+import random
 
 hostName = "localhost"
 serverPort = 8080
+
+iv = b'fdUCl1ovFJiENaYH'
 
 db = sqlite3.connect("totally_not_my_privateKeys.db")
 dbc = db.cursor()
 dbc.execute("""CREATE TABLE IF NOT EXISTS keys(
     kid INTEGER PRIMARY KEY AUTOINCREMENT,
     key BLOB NOT NULL,
-    exp INTEGER NOT NULL,
-)""")
+    exp INTEGER NOT NULL
+);""")
+dbc.execute("""CREATE TABLE IF NOT EXISTS users(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    email TEXT UNIQUE,
+    date_registered TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_login TIMESTAMP
+);""")
+dbc.execute("""CREATE TABLE IF NOT EXISTS auth_logs(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_ip TEXT NOT NULL,
+    request_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    user_id INTEGER,  
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);""")
+
 
 private_key = rsa.generate_private_key(
     public_exponent=65537,
@@ -38,13 +61,20 @@ expired_pem = expired_key.private_bytes(
     format=serialization.PrivateFormat.TraditionalOpenSSL,
     encryption_algorithm=serialization.NoEncryption()
 )
-dbc.execute("INSERT INTO keys (key, exp) VALUES (?, ?)", (pem, datetime.datetime.utcnow() + datetime.timedelta(hours=1)))
+
+cipher = Cipher(algorithms.AES(os.getenv("NOT_MY_KEY", default=bytes([random.randint(0, 255) for _ in range(32)]))), modes.CBC(iv))
+encryptor = cipher.encryptor()
+
+ct = encryptor.update(pem + bytes(16 - len(pem) % 16)) + encryptor.finalize()
+dbc.execute("INSERT INTO keys (key, exp) VALUES (?, ?);", (ct, datetime.datetime.utcnow() + datetime.timedelta(hours=1)))
 db.commit() # save keys
-dbc.execute("INSERT INTO keys (key, exp) VALUES (?, ?)", (expired_pem, datetime.datetime.utcnow() - datetime.timedelta(hours=1)))
+
+encryptor = cipher.encryptor()
+ct = encryptor.update(expired_pem + bytes(16 - len(expired_pem) % 16)) + encryptor.finalize()
+dbc.execute("INSERT INTO keys (key, exp) VALUES (?, ?);", (ct, datetime.datetime.utcnow() - datetime.timedelta(hours=1)))
 db.commit()
 
 numbers = private_key.private_numbers()
-
 
 def int_to_base64(value):
     """Convert an integer to a Base64URL-encoded string"""
@@ -82,7 +112,7 @@ class MyServer(BaseHTTPRequestHandler):
         parsed_path = urlparse(self.path)
         params = parse_qs(parsed_path.query)
         if parsed_path.path == "/auth":
-            dbc.execute("SELECT * FROM keys WHERE exp > ?", (datetime.datetime.utcnow(),)) # load good key
+            dbc.execute("SELECT * FROM keys WHERE exp > ?;", (datetime.datetime.utcnow(),)) # load good key
             kid, key, exp = dbc.fetchone()
             headers = {
                 "kid":"goodKID"
@@ -93,7 +123,7 @@ class MyServer(BaseHTTPRequestHandler):
                 "exp": exp
             }
             if 'expired' in params:
-                dbc.execute("SELECT * FROM keys WHERE exp < ?", (datetime.datetime.utcnow(),)) # load expired key
+                dbc.execute("SELECT * FROM keys WHERE exp < ?;", (datetime.datetime.utcnow(),)) # load expired key
                 kid, key, exp = dbc.fetchone()
                 headers["kid"] = "expiredKID"
                 token_payload["exp"] = exp
@@ -102,6 +132,31 @@ class MyServer(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(bytes(encoded_jwt, "utf-8"))
             return
+        if parsed_path.path == "/register":
+            token_payload = {
+                "username": params["username"] if ("username" in params) else "$MyCoolUsername",
+                "email": params["email"] if ("email" in params) else "$MyCoolEmail"
+            }
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            pw = str(uuid.uuid4()) # random uuid
+            self.wfile.write(bytes('{"password": "' + pw + '"}', "utf-8"))
+            kdf = Argon2id(salt=b"Malkovich", length=32, iterations=1, lanes=4, memory_cost=64 * 1024, ad=None, secret=None)
+            dbc.execute("INSERT INTO users (username, password_hash, email, last_login) VALUES (?, ?, ?, CURRENT_TIMESTAMP);", (token_payload["username"], kdf.derive(bytes(str(pw), "utf-8")), token_payload["email"]))
+            db.commit()
+        if parsed_path.path == "/auth": # authentication
+            token_payload = {
+                "username": params["username"] if ("username" in params) else "$MyCoolUsername",
+                "password": params["password"] if ("password" in params) else "$UUID4"
+            }
+            kdf = Argon2id(salt=b"Malkovich", length=32, iterations=1, lanes=4, memory_cost=64 * 1024, ad=None, secret=None)
+            dbc.execute("SELECT id FROM users WHERE username = ? AND password_hash = ?", (token_payload["username"], kdf.derive(bytes(token_payload["password"], "utf-8"))))
+            requestid = dbc.fetchone()
+            dbc.execute("INSERT INTO auth_logins (request_ip, user_id) VALUES (?, ?);", (self.client_address[0], requestid))
+            db.commit()
+            self.send_response(200)
+            self.end_headers()
 
         self.send_response(405)
         self.end_headers()
